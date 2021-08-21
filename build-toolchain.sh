@@ -13,10 +13,10 @@ function msg() {
 # Build LLVM
 msg "Building LLVM..."
 ./build-llvm.py \
-	--clang-vendor "Proton" \
+	--clang-vendor "Predator" \
+	--defines "LLVM_PARALLEL_COMPILE_JOBS=$(nproc) LLVM_PARALLEL_LINK_JOBS=$(nproc)" \
 	--targets "ARM;AArch64;X86" \
 	"$repo_flag" \
-	--pgo kernel-defconfig \
 	--lto full
 
 # Build binutils

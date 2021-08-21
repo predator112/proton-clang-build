@@ -23,16 +23,16 @@ function parse_parameters() {
                 shift
                 BUILD_FOLDER=${1}
                 ;;
+            "-k" | "--kernel-src")
+                shift
+                KERNEL_SRC=${1}
+                ;;
             "-p" | "--path-override")
                 shift
                 PATH_OVERRIDE=${1}
                 ;;
             "--pgo")
                 PGO=true
-                ;;
-            "-s" | "--src-folder")
-                shift
-                SRC_FOLDER=${1}
                 ;;
             "-t" | "--targets")
                 shift
@@ -42,6 +42,7 @@ function parse_parameters() {
                     case ${LLVM_TARGET} in
                         "AArch64") TARGETS+=("aarch64-linux-gnu") ;;
                         "ARM") TARGETS+=("arm-linux-gnueabi") ;;
+                        "Hexagon") TARGETS+=("hexagon-linux-gnu") ;;
                         "Mips") TARGETS+=("mipsel-linux-gnu") ;;
                         "PowerPC") TARGETS+=("powerpc-linux-gnu" "powerpc64-linux-gnu" "powerpc64le-linux-gnu") ;;
                         "RISCV") TARGETS+=("riscv64-linux-gnu") ;;
@@ -59,6 +60,7 @@ function set_default_values() {
     [[ -z ${TARGETS[*]} || ${TARGETS[*]} = "all" ]] && TARGETS=(
         "arm-linux-gnueabi"
         "aarch64-linux-gnu"
+        "hexagon-linux-gnu"
         "mipsel-linux-gnu"
         "powerpc-linux-gnu"
         "powerpc64-linux-gnu"
@@ -79,14 +81,27 @@ function setup_up_path() {
     [[ -n ${PATH_OVERRIDE} ]] && export PATH=${PATH_OVERRIDE}:${PATH}
 }
 
+# Turns 'patch -N' from a fatal error to an informational message
+function apply_patch {
+    PATCH_FILE=${1:?}
+    if ! PATCH_OUT=$(patch -Np1 <"${PATCH_FILE}"); then
+        PATCH_OUT_OK=$(echo "${PATCH_OUT}" | grep "Reversed (or previously applied) patch detected")
+        if [[ -n ${PATCH_OUT_OK} ]]; then
+            echo "${PATCH_FILE##*/}: ${PATCH_OUT_OK}"
+        else
+            echo "${PATCH_OUT}"
+            exit 2
+        fi
+    fi
+}
+
 function setup_krnl_src() {
-    # A kernel folder can be supplied via '-f' for testing the script
-    if [[ -n ${SRC_FOLDER} ]]; then
-        cd "${SRC_FOLDER}" || exit 1
+    # A kernel folder can be supplied via '-k' for testing the script
+    if [[ -n ${KERNEL_SRC} ]]; then
+        cd "${KERNEL_SRC}" || exit 1
     else
-        LINUX=linux-5.11.11
+        LINUX=linux-5.13.6
         LINUX_TARBALL=${KRNL}/${LINUX}.tar.xz
-        LINUX_PATCH=${KRNL}/${LINUX}-${CONFIG_TARGET}.patch
 
         # If we don't have the source tarball, download and verify it
         if [[ ! -f ${LINUX_TARBALL} ]]; then
@@ -102,10 +117,16 @@ function setup_krnl_src() {
         fi
 
         # If there is a patch to apply, remove the folder so that we can patch it accurately (we cannot assume it has already been patched)
-        [[ -f ${LINUX_PATCH} ]] && rm -rf ${LINUX}
+        PATCH_FILES=()
+        for SRC_FILE in "${KRNL}"/*; do
+            [[ ${SRC_FILE##*/} = *.patch ]] && PATCH_FILES+=("${SRC_FILE}")
+        done
+        [[ -n "${PATCHES[*]}" ]] && rm -rf ${LINUX}
         [[ -d ${LINUX} ]] || { tar -xf "${LINUX_TARBALL}" || exit ${?}; }
         cd ${LINUX} || exit 1
-        [[ -f ${LINUX_PATCH} ]] && { patch -p1 <"${LINUX_PATCH}" || exit ${?}; }
+        for PATCH_FILE in "${PATCH_FILES[@]}"; do
+            apply_patch "${PATCH_FILE}"
+        done
     fi
 }
 
@@ -113,6 +134,8 @@ function check_binutils() {
     # Check for all binutils and build them if necessary
     BINUTILS_TARGETS=()
     for PREFIX in "${TARGETS[@]}"; do
+        # Hexagon does not build binutils
+        [[ ${PREFIX} = "hexagon-linux-gnu" ]] && continue
         # We assume an x86_64 host, should probably make this more generic in the future
         if [[ ${PREFIX} = "x86_64-linux-gnu" ]]; then
             COMMAND=as
@@ -144,6 +167,7 @@ function build_kernels() {
     case "$(uname -m)" in
         arm*) [[ ${TARGETS[*]} =~ arm ]] || NEED_GCC=true ;;
         aarch64) [[ ${TARGETS[*]} =~ aarch64 ]] || NEED_GCC=true ;;
+        hexagon) [[ ${TARGETS[*]} =~ hexagon ]] || NEED_GCC=true ;;
         mips*) [[ ${TARGETS[*]} =~ mips ]] || NEED_GCC=true ;;
         ppc*) [[ ${TARGETS[*]} =~ powerpc ]] || NEED_GCC=true ;;
         s390*) [[ ${TARGETS[*]} =~ s390 ]] || NEED_GCC=true ;;
@@ -163,12 +187,22 @@ function build_kernels() {
     for TARGET in "${TARGETS[@]}"; do
         case ${TARGET} in
             "arm-linux-gnueabi")
-                time \
-                    "${MAKE[@]}" \
-                    ARCH=arm \
-                    CROSS_COMPILE="${TARGET}-" \
-                    KCONFIG_ALLCONFIG=<(echo CONFIG_CPU_BIG_ENDIAN=n) \
-                    distclean "${CONFIG_TARGET}" zImage modules || exit ${?}
+                case ${CONFIG_TARGET} in
+                    defconfig)
+                        CONFIGS=(multi_v5_defconfig aspeed_g5_defconfig multi_v7_defconfig)
+                        ;;
+                    *)
+                        CONFIGS=("${CONFIG_TARGET}")
+                        ;;
+                esac
+                for CONFIG in "${CONFIGS[@]}"; do
+                    time \
+                        "${MAKE[@]}" \
+                        ARCH=arm \
+                        CROSS_COMPILE="${TARGET}-" \
+                        KCONFIG_ALLCONFIG=<(echo CONFIG_CPU_BIG_ENDIAN=n) \
+                        distclean "${CONFIG}" all || exit ${?}
+                done
                 ;;
             "aarch64-linux-gnu")
                 time \
@@ -176,21 +210,29 @@ function build_kernels() {
                     ARCH=arm64 \
                     CROSS_COMPILE="${TARGET}-" \
                     KCONFIG_ALLCONFIG=<(echo CONFIG_CPU_BIG_ENDIAN=n) \
-                    distclean "${CONFIG_TARGET}" Image.gz modules || exit ${?}
+                    distclean "${CONFIG_TARGET}" all || exit ${?}
+                ;;
+            "hexagon-linux-gnu")
+                time \
+                    "${MAKE[@]}" \
+                    ARCH=hexagon \
+                    CROSS_COMPILE="${TARGET}-" \
+                    LLVM_IAS=1 \
+                    distclean defconfig all || exit ${?}
                 ;;
             "mipsel-linux-gnu")
                 time \
                     "${MAKE[@]}" \
                     ARCH=mips \
                     CROSS_COMPILE="${TARGET}-" \
-                    distclean malta_defconfig vmlinux modules || exit ${?}
+                    distclean malta_defconfig all || exit ${?}
                 ;;
             "powerpc-linux-gnu")
                 time \
                     "${MAKE[@]}" \
                     ARCH=powerpc \
                     CROSS_COMPILE="${TARGET}-" \
-                    distclean ppc44x_defconfig zImage modules || exit ${?}
+                    distclean ppc44x_defconfig all || exit ${?}
                 ;;
             "powerpc64-linux-gnu")
                 time \
@@ -198,14 +240,14 @@ function build_kernels() {
                     ARCH=powerpc \
                     LD="${TARGET}-ld" \
                     CROSS_COMPILE="${TARGET}-" \
-                    distclean pseries_defconfig disable-werror.config vmlinux modules || exit ${?}
+                    distclean pseries_defconfig disable-werror.config all || exit ${?}
                 ;;
             "powerpc64le-linux-gnu")
                 time \
                     "${MAKE[@]}" \
                     ARCH=powerpc \
                     CROSS_COMPILE="${TARGET}-" \
-                    distclean powernv_defconfig zImage.epapr modules || exit ${?}
+                    distclean powernv_defconfig all || exit ${?}
                 ;;
             "riscv64-linux-gnu")
                 RISCV_MAKE=(
@@ -218,7 +260,7 @@ function build_kernels() {
                 time "${RISCV_MAKE[@]}" distclean defconfig || exit ${?}
                 # https://github.com/ClangBuiltLinux/linux/issues/1143
                 grep -q "config EFI" arch/riscv/Kconfig && scripts/config --file out/.config -d EFI
-                time "${RISCV_MAKE[@]}" Image.gz modules || exit ${?}
+                time "${RISCV_MAKE[@]}" all || exit ${?}
                 ;;
             "s390x-linux-gnu")
                 time \
@@ -228,12 +270,12 @@ function build_kernels() {
                     LD="${TARGET}-ld" \
                     OBJCOPY="${TARGET}-objcopy" \
                     OBJDUMP="${TARGET}-objdump" \
-                    distclean defconfig bzImage modules || exit ${?}
+                    distclean defconfig all || exit ${?}
                 ;;
             "x86_64-linux-gnu")
                 time \
                     "${MAKE[@]}" \
-                    distclean "${CONFIG_TARGET}" bzImage modules || exit ${?}
+                    distclean "${CONFIG_TARGET}" all || exit ${?}
                 ;;
         esac
     done

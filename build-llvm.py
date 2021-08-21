@@ -16,8 +16,7 @@ import urllib.request as request
 from urllib.error import URLError
 
 # This is a known good revision of LLVM for building the kernel
-# To bump this, run 'PATH_OVERRIDE=<path_to_updated_toolchain>/bin kernel/build.sh --allyesconfig'
-GOOD_REVISION = 'ecdae5df7da03c56d72796c0b1629edd0995548e'
+GOOD_REVISION = '54588bcc052e5b08f90e672c33d0c1ad4eda2424'
 
 
 class Directories:
@@ -843,11 +842,12 @@ def project_cmake_defines(args, stage):
             projects = "clang;lld"
             if args.pgo:
                 projects += ';compiler-rt'
+        elif instrumented_stage(args, stage):
+            projects = "clang;lld"
+        elif args.projects:
+            projects = args.projects
         else:
-            if instrumented_stage(args, stage):
-                projects = "clang;lld"
-            else:
-                projects = "clang;compiler-rt;lld;polly"
+            projects = "clang;compiler-rt;lld;polly"
 
     defines['LLVM_ENABLE_PROJECTS'] = projects
 
@@ -857,7 +857,6 @@ def project_cmake_defines(args, stage):
             defines['COMPILER_RT_BUILD_LIBFUZZER'] = 'OFF'
             # We only use compiler-rt for the sanitizers, disable some extra stuff we don't need
             # Chromium OS also does this: https://crrev.com/c/1629950
-            defines['COMPILER_RT_BUILD_BUILTINS'] = 'OFF'
             defines['COMPILER_RT_BUILD_CRT'] = 'OFF'
             defines['COMPILER_RT_BUILD_XRAY'] = 'OFF'
         # We don't need the sanitizers for the stage 1 bootstrap
@@ -878,7 +877,7 @@ def get_targets(args):
     elif args.full_toolchain:
         targets = "all"
     else:
-        targets = "AArch64;ARM;BPF;Mips;PowerPC;RISCV;SystemZ;X86"
+        targets = "AArch64;ARM;BPF;Hexagon;Mips;PowerPC;RISCV;SystemZ;X86"
 
     return targets
 
@@ -1160,7 +1159,7 @@ def kernel_build_sh(args, config, dirs):
     if config != "defconfig":
         build_sh += ['--%s' % config]
     if dirs.linux_folder:
-        build_sh += ['-s', dirs.linux_folder.as_posix()]
+        build_sh += ['-k', dirs.linux_folder.as_posix()]
     show_command(args, build_sh)
     subprocess.run(build_sh, check=True, cwd=dirs.build_folder.as_posix())
 
